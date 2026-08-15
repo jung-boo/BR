@@ -1,0 +1,5 @@
+# 终极形态的依赖锁定（供参考，可直接写进 requirements.txt）
+torch==2.2.2       # 或者团队目前最稳定的版本
+torchvision==0.17.2
+numpy==1.26.4      # 核心防坑点
+fvcore==0.1.5.post20221221
