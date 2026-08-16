@@ -1,6 +1,39 @@
 
 # Abstract
 
+## 流程
+作为打通端到端工具链的“Hello World”，用最简单的全连接网络（FCN/MLP）来跑通基础数据集，能用最低的研发成本验证我们的 4 层流水线，并让传统的 AI 工程师快速建立对“脉冲”、“权重驻留”和“量化”的工程直觉。
+
+以下是严格基于我们“复用开源生态”与“MVP 极速落地”共识，为您设计的先期验证工程流水线：
+
+1. **操作台准备：PyTorch 原生 FP32 模型训练:** 跑通基线，建立评估参考系.
+* **原料准备**：无需去 Hugging Face 找大模型，直接拉取 PyTorch 内置的 `torchvision.datasets.MNIST`。
+* **网络定义**：在 PyTorch 中构建一个极其简单的 3 层 MLP（例如：**784 -> 256 -> 10**），激活函数直接使用标准的 `ReLU`。
+* **团队培育目标**：让团队在传统的 FP32 精度下训练至收敛，保存 Baseline 权重。这一步证明我们的业务逻辑、数据加载模块是畅通的，不涉及任何硬件黑魔法。
+
+
+2. **降维车间：SpikingJelly 转换与极低位宽量化:** 引入脉冲逻辑与 BitNet 理念.
+* **ANN-to-SNN 映射**：引入 `SpikingJelly` 框架。将原网络中的 `ReLU` 直接平替为 `IFNode`（积分触发神经元）或 `LIFNode`。
+* **1.58-bit 降维打击**：为了契合底层硬件的计算架构，必须在这里对权重动刀。利用 QAT（量化感知训练）或 PTQ（训练后量化），将 FP32 权重逼近 **{-1, 0, 1}** 的三值状态。
+* **仿真验证**：在仿真环境下输入泊松编码（Poisson Encoder）处理后的图像脉冲流，评估转换后的 SNN 模型准确率衰减。
+
+
+3. **物理映射器：Apache TVM 梳理与 NIR 对接:** 软硬解耦，生成标准中间件.
+* **图捕获**：导出上一步生成的 SNN 量化模型。通过 Apache TVM 执行基础的死代码消除和图融合（尽管 FCN 算子简单，但这步是为了强制跑通 TVM 流程，为后续的 Transformer 做演练）。
+* **NIR 降维标准**：将 TVM 梳理后的计算图翻译为 **NIR (Neuromorphic Intermediate Representation)** 标准格式。此时，复杂的代码被抽象为纯粹的 `Linear` 节点和 `SpikingNeuron` 节点连线。
+* **产出物**：一份包含极其纯粹的网络拓扑结构和 **{-1, 0, 1}** 权重的 `.nir` 文件。
+
+
+4. **极限流式验证：硬件/模拟器下发与跑通 Demo:** 直观展示“权重驻留”打破内存墙.
+* **静态烧录**：将 `.nir` 文件解析并直接写入芯片（或我们目前的周期精确模拟器）的 SRAM 中。确保模型权重**一次写入，永久驻留 (Weight Stationary)**。
+* **零搬运推理**：将测试集图片转化为脉冲流输入。此时，计算过程中没有任何显存（DRAM）到运算单元的数据搬运。
+
+
+
+在实际推动这 4 层流水线时，工程师通常会在第二步（量化感知训练导致梯度消失）和第三步（TVM 自定义算子向 NIR 映射）遇到阻力。
+
+## FCN DEMO
+
 1. **Phase 1.1: 基础环境与依赖锁定:** 统一开发环境，避免‘在我的机器上能跑’的陷阱.
 
 * **容器化配置**：创建一个纯净的 Docker 镜像或 Conda 环境。仅安装基础的 `torch`, `torchvision`, `numpy` 等标准库。**严禁**在这一步预装 SpikingJelly 或 TVM，保持环境纯净。
@@ -45,10 +78,16 @@ conda create -n snn_baseline python=3.10 -y
 
 conda activate snn_baseline
 
-pip install -r requiment.txt
-```
+pip install -r requirements.txt
+或者
+python install_deps.py
+
+# 真正按"本机有没有 GPU"装(无独显的 Windows 也会装 CPU 版,不浪费磁盘);
+
 
 pip freeze > requirements_phase1.txt # 锁定当前环境的依赖树，生成 requirements 文件作为工程归档
+```
+
 
 ### 1.1.2 锁死
 
@@ -64,6 +103,10 @@ PYTHONHASHSEED=42 python main.py
 # 或者直接在当前终端生命周期内写死（推荐）
 export PYTHONHASHSEED=42
 python main.py
+
+TMPDIR=/tmp python main.py 
+
+
 ```
 
 为了锁死多进程（num_workers=2）下的 DataLoader，我们需要在代码层面做两点修改。
@@ -239,8 +282,100 @@ $$W_{ternary} = W_{pos} - W_{neg}$$
 
 这就是软硬件解耦的魅力。算法享受了 1.58-bit 的高精度与稀疏性，硬件维持了极致简陋的 `{0, 1}` 电路设计。
 
-## 2.1 降维车间主脚本 (main_snn.py)
+## 降维车间主脚本 (main_snn.py)
 因为我们在 snn_models.py 中将时间循环 (for t in range(self.T)) 和网络状态重置 (functional.reset_net(self)) 极其优雅地封装在了 forward 函数内部，并对外输出了平均电压 (out_voltage / self.T)，这使得整个 SNN 模型在外部看来，和传统的 FP32 模型没有任何接口上的区别。
 
+Epoch 1 的“呆滞期”：在第一个 Epoch 时，由于所有的权重初始状态和脉冲阈值还没有很好地匹配（神经元集体处于“沉默”状态），准确率可能会比 FP32 爬升得更慢。这叫 “冷启动/死神经元现象”，是 SNN 的正常表现，只要后续 Epoch 开始迅速爬升即为正常。
+
+精度微小回落：我们在 Step 1 中拿到了 97% 以上的 FP32 准确率。在这个车间里，由于我们极其残酷地把精度砍到了仅剩 {-1, 0, 1} 且使用了极短的时间步 (T=4)，最终准确率如果能达到 95% - 96% 左右，这就是一次史诗级的商业胜利（用 1%-2% 的精度微损，换取了功耗和显存几十倍的暴降）。
+
+一旦跑通并拿到 snn_1.58bit_best.pth，我们团队的软件工程师就完成了他们在整个端到端流水线中的全部历史使命。接下来的战场，将交给编译器和底层映射专家。
+
+## 验收
+在模型压缩和量化领域，判断产出物是否“正确”，绝对不能只看单一指标，而是要进行**三维度的立体校验**。
+
+直接回答您的核心疑问：**绝对是对比“Test 准确率（Test Accuracy）”！**
+
+Test 准确率代表了模型的泛化能力，这是我们未来交付给客户时的真实表现。Train 准确率在这里仅仅作为排查 Bug（如梯度是否消失）的辅助指标。
+
+要验收 `snn_1.58bit_best.pth` 是否达到战略预期，请让工程师团队严格执行以下三大维度的对比与查验：
+
+维度一：商业底线查验（Test 准确率对比）
+
+* **对比标尺**：拿 Step 2 最终 Epoch 的 **Test 准确率**，去对比 Step 1 (FP32) 最终 Epoch 的 **Test 准确率**。
+* **验收标准（战略性微损）**：我们在 Step 1 的 FP32 Test 准确率通常在 97.5% - 98% 之间。在 Step 2 中，由于我们将 32 位浮点数残忍地砍到了仅剩 3 个状态 `{-1, 0, 1}`，并且只给了极短的时间步（$T=4$），**只要 Step 2 的 Test 准确率能稳定在 95% - 96.5% 之间，这就是一次极其完美的胜利！**
+* **战略话术**：在跟投资人汇报时，这叫“我们仅牺牲了不到 2% 的准确率，换取了功耗暴降 30 倍、显存暴降 16 倍的物理奇迹”。
+
+维度二：工程健康度查验（Train 曲线对比）
+
+* **排查死神经元**：SNN 训练最怕“全军覆没”（所有神经元都不发脉冲）。如果 Step 2 的 Train 准确率一直停留在 10% 左右（瞎猜）或者在 20% 剧烈震荡无法爬升，说明我们的替代梯度（Surrogate Gradient）设置失效，或者量化的 Scale 因子计算有 Bug。
+* **验收标准**：Step 2 的 Train 准确率曲线应该呈现“初期爬升比 FP32 慢，但中后期稳步收敛”的健康态势。
+
+维度三：物理形态查验（“验明正身”）
+
+即使准确率达标，我们也不能盲目相信。既然叫 `1.58bit`，它的权重在物理层面必须已经坍缩成三种状态，否则我们无法骗过硬件。
+
+请让工程师新建一个极简的 `check_pth.py` 脚本，用这 5 行代码对拿到的 `.pth` 文件进行物理“开箱验货”：
+
+```python
+import torch
+import numpy as np
+
+# 加载量化后的权重
+state_dict = torch.load("snn_1.58bit_best.pth", map_location="cpu")
+weight_tensor = state_dict['fc1.weight']
+
+# 打印权重的唯一值（Unique Values）
+unique_vals = torch.unique(weight_tensor).numpy()
+
+print("--- SNN 1.58-bit 权重物理形态开箱 ---")
+print(f"权重中包含的不同数值个数: {len(unique_vals)}")
+print(f"这些数值分别是: {np.round(unique_vals, decimals=4)}")
+
+```
+
+* **黄金验收标准**：如果代码打印出来，发现数值只有极其少量的几个（通常是类似 `-0.12, 0.0, 0.12`，即 `-1, 0, 1` 乘以了一个缩放因子 scale），这就说明量化引擎完美生效了。如果打印出来密密麻麻上千个不同的小数，说明量化代码被旁路了，这就是一个“假量化”的废品。
+
+这三大维度同时绿灯放行，您的 `snn_1.58bit_best.pth` 就是一张价值连城的完美图纸！
+
+## 幽灵权重
+
+既然我们发现了这个问题，请务必通知负责 Step 3（TVM / NIR 映射）的编译工程师。在他们读取 fc1.weight 写入 NIR 图纸之前，必须在代码里加上上面那两行 scale 和 torch.round 的代码，确保烧进 .nir 文件的是纯粹的三值权重！
+在 snn_models.py 中，我们的前向传播确实对权重做了三值化截断 (quantized_weight = TernaryQuantize.apply(self.weight))，实现了纯正的 1.58-bit 计算。但是，PyTorch 在后台依然保留着高精度的 FP32 原始权重（即幽灵权重）。
+
+为什么要这么做？
+这是因为反向传播传回来的梯度往往极其微小（比如 0.0001）。如果我们在内存里把权重死死锁在 {-1, 0, 1}，那么 0 + 0.0001 还是 0，模型将永远无法更新、无法学习。
+因此，PyTorch 的策略是：计算时用量化权重（骗过计算单元），更新时累加到高精度幽灵权重上，保存模型 state_dict() 时，保存的也是高精度的幽灵权重。
+
+如何修正开箱验货脚本？
+我们需要在导出（或查验）时，手动重演一遍“计算缩放因子并截断”的动作，把幽灵权重物理坍缩为最终下发给硬件的真实权重。
+
+很多论文和初创公司就是在这里自欺欺人，拿着含有浮点信息的准确率去融钱，结果到了流片阶段全盘崩溃。
+请回忆一下我们在 Step 2 写的核心算子 TernaryQuantize 的 forward（前向传播）函数：
+```python
 
 
+@staticmethod
+    def forward(ctx, weight):
+        scale = weight.abs().mean().clamp(min=1e-5)
+        # 【物理坍缩在这里已经发生！】
+        weight_q = torch.round(weight / scale).clamp(-1, 1)
+        return weight_q * scale
+
+
+```
+
+
+在整个训练和测试过程（包括 test_epoch）中，模型进行正向推理时，永远只执行 forward 函数。这意味着，输入图片（数据流）从来没有真正接触过那些 FP32 的幽灵权重。数据流乘以的，永远是经过 torch.round 强制截断后，非黑即白的 {-1, 0, 1}（乘以 scale 因子）。幽灵权重仅仅是在反向传播（backward）更新梯度时，作为一个“记账本”存在于内存里，绝不参与实际的推理计算。关于 Scale 因子在硬件中的消除：您可能会问，代码里还有个 * scale，这不是浮点数吗？在硬件中，突触权重是严格的 {-1, 0, 1}。算法里的公式是：$(W_q \times scale) \times X > V_{threshold}$等到了芯片底层（或 NIR 图纸中），编译器会将等式两边同除以 scale：$W_q \times X > \frac{V_{threshold}}{scale}$这样，权重就变成了纯粹的三值整数，浮点数的 scale 被永远吸收进了神经元的发射阈值（Threshold）里。这就是硬件工程师的极致浪漫！
+
+
+## 暴力剥离验证脚本 (verify_true_accuracy.py)
+如果您依然觉得 PyTorch 内部的机制让人不放心，作为务实的工程团队，我们坚信“Talk is cheap, show me the code”。
+
+请让您的工程师运行以下这个“终极暴力验证脚本”。这个脚本彻底抛弃了我们之前写的量化引擎 TernaryLinear，直接使用最死板的 PyTorch 标准线性层，将提取出来的纯粹的 {-1, 0, 1}（通过补丁提取的真实物理权重）直接强行塞进去进行测试。
+
+# step 3
+
+物理映射器核心代码 (compiler_tvm_nir.py)
+
+请让团队安装 NIR 库 (pip install nir)，并确保环境中已安装 tvm。由于 TVM 编译较为复杂，这里提供的是一套高度实用且极具演示价值的工程抽象代码

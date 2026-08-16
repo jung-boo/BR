@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import time
 
-from utils import set_deterministic_environment
+from utils import set_deterministic_environment, get_device
 from data_loader import build_data_pipeline
 from model import BaselineMLP
 
@@ -65,8 +65,8 @@ def main():
     # 1. 绝对环境锁定 (Phase 1.1)
     set_deterministic_environment(seed=42)
     
-    # 2. 硬件设备检测
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 2. 硬件设备检测 (自动: CUDA GPU 优先, 回退 CPU)
+    device = get_device()
     print(f"[Pipeline] 当前训练硬件: {device}")
     
     # 3. 数据流水线构建 (Phase 1.2)

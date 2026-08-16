@@ -4,7 +4,7 @@ import torch.optim as optim
 import time
 
 # 复用 Step 1 的无菌环境与数据流水线
-from utils import set_deterministic_environment
+from utils import set_deterministic_environment, get_device
 from data_loader import build_data_pipeline
 
 # 【核心替换】导入我们在降维车间新打造的 SNN 模型
@@ -50,7 +50,8 @@ def main():
     # 依然需要锁定随机种子，以便与 Step 1 的基线进行绝对公平的对比
     # set_deterministic_environment(seed=42)
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 硬件设备检测 (自动: CUDA GPU 优先, 回退 CPU)
+    device = get_device()
     print(f"[Pipeline] 当前训练硬件: {device}")
     
     train_loader, test_loader = build_data_pipeline(batch_size=128)

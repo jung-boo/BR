@@ -1,5 +1,25 @@
-# 终极形态的依赖锁定（供参考，可直接写进 requirements.txt）
-torch==2.2.2       # 或者团队目前最稳定的版本
-torchvision==0.17.2
-numpy==1.26.4      # 核心防坑点
+# ============================================================
+# 依赖清单 —— torch/torchvision 按平台自动选择版本
+#
+#   · Windows / Linux : 安装 CUDA 版 (torch==2.2.2+cu121)
+#   · macOS           : 安装 CPU 版 (PyPI 默认轮子, mac 无 NVIDIA GPU)
+#
+# 注意: requirements.txt 是静态清单, 只能按"平台"分支。
+#   若需要按"本机是否真有 NVIDIA GPU"精确选择
+#   (例如无独显的 Windows 也装 CPU 版), 请改用:
+#       python install_deps.py
+#   该脚本会检测 nvidia-smi 后动态选择 GPU/CPU 版本。
+# ============================================================
+
+# 让 pip 能够找到 PyTorch 官方 CUDA 轮子 (+cu121)
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# 平台级自动选择: 非 macOS 装 CUDA 版, macOS 装 CPU 版
+torch==2.2.2+cu121; sys_platform != "darwin"
+torch==2.2.2; sys_platform == "darwin"
+torchvision==0.17.2+cu121; sys_platform != "darwin"
+torchvision==0.17.2; sys_platform == "darwin"
+
+# 其余通用依赖
+numpy==1.26.4      # 核心防坑点: 必须 <2, 否则 fvcore/torchvision 兼容性崩溃
 fvcore==0.1.5.post20221221
