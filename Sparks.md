@@ -1,6 +1,8 @@
-【中转英输入】
-By the way, why theoretically can we cut the precision down to only {-1, 0, 1} and use a very short time step (T=4), and still achieve a final accuracy of around 95% - 96%? The advantage of SNN is trading space for time. My understanding is that this unrolling during training is a disaster, making it completely impossible to train large models, but during inference, the space expansion is much smaller. However, I still don't know exactly how severe the space expansion is during inference.
-
+---
+toc:
+  depth_from: 1
+  depth_to: 2
+  ordered: false
 ---
 
 【英转中输出】

@@ -1,381 +1,232 @@
+---
+toc:
+  depth_from: 1
+  depth_to: 2
+  ordered: false
+---
 
-# Abstract
+# 类脑芯片端到端工具链验证（Hello World）
 
-## 流程
-作为打通端到端工具链的“Hello World”，用最简单的全连接网络（FCN/MLP）来跑通基础数据集，能用最低的研发成本验证我们的 4 层流水线，并让传统的 AI 工程师快速建立对“脉冲”、“权重驻留”和“量化”的工程直觉。
+本项目以最简全连接网络（FCN/MLP）+ MNIST 为验证载体，跑通类脑（神经形态）芯片的 **4 层端到端工具链流水线**，以最低成本验证"复用开源生态"的技术路线，并让工程团队建立对**脉冲（Spike）、权重驻留（Weight Stationary）**与**极低位宽量化**的工程直觉：
 
-以下是严格基于我们“复用开源生态”与“MVP 极速落地”共识，为您设计的先期验证工程流水线：
-
-1. **操作台准备：PyTorch 原生 FP32 模型训练:** 跑通基线，建立评估参考系.
-* **原料准备**：无需去 Hugging Face 找大模型，直接拉取 PyTorch 内置的 `torchvision.datasets.MNIST`。
-* **网络定义**：在 PyTorch 中构建一个极其简单的 3 层 MLP（例如：**784 -> 256 -> 10**），激活函数直接使用标准的 `ReLU`。
-* **团队培育目标**：让团队在传统的 FP32 精度下训练至收敛，保存 Baseline 权重。这一步证明我们的业务逻辑、数据加载模块是畅通的，不涉及任何硬件黑魔法。
-
-
-2. **降维车间：SpikingJelly 转换与极低位宽量化:** 引入脉冲逻辑与 BitNet 理念.
-* **ANN-to-SNN 映射**：引入 `SpikingJelly` 框架。将原网络中的 `ReLU` 直接平替为 `IFNode`（积分触发神经元）或 `LIFNode`。
-* **1.58-bit 降维打击**：为了契合底层硬件的计算架构，必须在这里对权重动刀。利用 QAT（量化感知训练）或 PTQ（训练后量化），将 FP32 权重逼近 **{-1, 0, 1}** 的三值状态。
-* **仿真验证**：在仿真环境下输入泊松编码（Poisson Encoder）处理后的图像脉冲流，评估转换后的 SNN 模型准确率衰减。
-
-
-3. **物理映射器：Apache TVM 梳理与 NIR 对接:** 软硬解耦，生成标准中间件.
-* **图捕获**：导出上一步生成的 SNN 量化模型。通过 Apache TVM 执行基础的死代码消除和图融合（尽管 FCN 算子简单，但这步是为了强制跑通 TVM 流程，为后续的 Transformer 做演练）。
-* **NIR 降维标准**：将 TVM 梳理后的计算图翻译为 **NIR (Neuromorphic Intermediate Representation)** 标准格式。此时，复杂的代码被抽象为纯粹的 `Linear` 节点和 `SpikingNeuron` 节点连线。
-* **产出物**：一份包含极其纯粹的网络拓扑结构和 **{-1, 0, 1}** 权重的 `.nir` 文件。
-
-
-4. **极限流式验证：硬件/模拟器下发与跑通 Demo:** 直观展示“权重驻留”打破内存墙.
-* **静态烧录**：将 `.nir` 文件解析并直接写入芯片（或我们目前的周期精确模拟器）的 SRAM 中。确保模型权重**一次写入，永久驻留 (Weight Stationary)**。
-* **零搬运推理**：将测试集图片转化为脉冲流输入。此时，计算过程中没有任何显存（DRAM）到运算单元的数据搬运。
-
-
-
-在实际推动这 4 层流水线时，工程师通常会在第二步（量化感知训练导致梯度消失）和第三步（TVM 自定义算子向 NIR 映射）遇到阻力。
-
-## FCN DEMO
-
-1. **Phase 1.1: 基础环境与依赖锁定:** 统一开发环境，避免‘在我的机器上能跑’的陷阱.
-
-* **容器化配置**：创建一个纯净的 Docker 镜像或 Conda 环境。仅安装基础的 `torch`, `torchvision`, `numpy` 等标准库。**严禁**在这一步预装 SpikingJelly 或 TVM，保持环境纯净。
-* **随机种子固定**：在代码入口处强制写死随机种子（`torch.manual_seed` 等），确保所有的权重初始化和数据打乱是 100% 可复现的。这是后续比对 SNN 精度损失的重要前提。
-
-1. **Phase 1.2: 数据摄入流水线构建:** 打通输入血脉，规范化张量形状.
-
-* **拉取开源数据集**：直接调用 `torchvision.datasets.MNIST`。不折腾任何自建数据集，降低早期验证的工程复杂度。
-* **预处理与降维**：设置 `transforms`。将 28x28 的单通道图像像素值归一化到 `[0, 1]` 区间。并在 `DataLoader` 吐出数据后，利用 `.view(-1, 28*28)` 将图像强制展平为 `784` 维的一维张量。
-* **批次切分**：设定合理的 Batch Size（如 64 或 128），跑通 Train/Test Split。
-
-1. **Phase 1.3: FP32 原生拓扑结构定义:** 严格限制算子，为后续‘平替’留出后门.
-
-* **极简网络构建**：继承 `nn.Module`，写一个最朴素的 3 层全连接网络（MLP）。例如 `784 (Input) -> 256 (Hidden) -> 10 (Output)`。
-* **算子克制**：必须使用标准的 `nn.Linear` 和 `nn.ReLU`。**严禁**使用 Batch Normalization、Dropout 或复杂的激活函数（如 GELU/Swish）。
-* **架构意图**：这种极简设计是为了 Step 2 埋下伏笔。到了降维车间，我们只需要做一件极其简单的事：把代码里的 `nn.ReLU` 文本替换为 SpikingJelly 的 `IFNode`。
-
-1. **Phase 1.4: 训练循环与收敛验证:** 标准反向传播，获取最佳权重基线.
-
-* **损失与优化**：使用最经典的交叉熵损失 `nn.CrossEntropyLoss` 和 `Adam`（或 SGD）优化器。
-* **训练至收敛**：在 GPU 上启动训练循环（通常 5-10 个 Epoch 即可），目标是在 MNIST 测试集上达到 **97% - 98%** 的准确率。
-* **日志打印**：输出每一个 Epoch 的 Loss 和 Accuracy 变化曲线。
-
-1. **Phase 1.5: 产物导出与基线剖析 (Profiling):** 收集‘传统架构的罪证’，作为后续吊打的靶子.
-
-* **权重落盘**：将训练好的模型状态字典（`state_dict`）保存为标准的 `baseline_fp32.pth` 文件。这就是我们在 Step 1 产出的唯一“原材料”。
-* **资源统计（核心商业武器）**：使用 `fvcore` 或 `torchprofile` 等工具，静态统计该 FP32 模型执行一次单次推理（Batch Size=1）时的 **MACs（乘加操作数）、参数量、显存占用大小**。
-* **战略意图**：这组庞大且高耗能的数字，将成为后续我们在客户面前展示类脑芯片 MVP Demo（0 乘法、极低显存搬运）时的完美背景板。
-
-在这个阶段，代码越“平庸”、越“标准”越好。
-
-## 1.1 基础环境与依赖锁定
-
-Phase 1.1 的核心目标是“消除一切不确定性”。在类脑工程的早期验证中，最大的灾难就是发现 FP32 基线和 SNN 量化模型的对比结果无法复现。
-
-为了确保后续降维车间（Step 2）中的任何精度损耗都能精准归因于算法本身，我们需要向工程师下达两份标准文件：环境锁定脚本和随机种子锁定代码。
-
-### 1.1.1 env
-
-```python
-conda create -n snn_baseline python=3.10 -y
-
-conda activate snn_baseline
-
-pip install -r requirements.txt
-或者
-python install_deps.py
-
-# 真正按"本机有没有 GPU"装(无独显的 Windows 也会装 CPU 版,不浪费磁盘);
-
-
-pip freeze > requirements_phase1.txt # 锁定当前环境的依赖树，生成 requirements 文件作为工程归档
+```text
+PyTorch FP32 基线  →  1.58-bit SNN 量化  →  NIR 标准图  →  硬件/模拟器流式验证
+   (Step 1)               (Step 2)           (Step 3)         (Step 4)
 ```
 
+## 流水线总览
 
-### 1.1.2 锁死
+| 步骤 | 目标 | 核心手段 | 产出物 |
+| --- | --- | --- | --- |
+| **Step 1 操作台** | 建立 FP32 基线，作为精度与能耗的评估参考系 | PyTorch 训练 3 层 MLP，fvcore 静态剖析 | `baseline_fp32_best.pth` |
+| **Step 2 降维车间** | 引入脉冲逻辑与 1.58-bit 三值量化 | SpikingJelly + QAT（STE），权重逼近 {-1, 0, 1} | `snn_1.58bit_best.pth` |
+| **Step 3 物理映射器** | 软硬解耦，产出标准中间表示 | 权重物理坍缩，构建 NIR 计算图（TVM 挂起） | `snn_mvp_model.nir` |
+| **Step 4 流式验证** | 证明"权重驻留"打破内存墙 | 泊松编码 + 流式下发 + 三大商业探针 | 脉冲输入流与期望标签（`.npy`） |
 
-修复 1：把 PYTHONHASHSEED 踢出脚本，交给环境变量
-这个问题的解决极其简单粗暴：不要在 Python 代码里设置它，而是在工程师执行训练的 Bash 环境中强制注入。
+## 目录结构
 
-在 Phase 1.1 的环境配置规范中，明确要求工程师使用以下命令启动训练：
+| 文件 | 所属步骤 | 职责 |
+| --- | --- | --- |
+| `main.py` | Step 1 | FP32 基线训练入口（含 fvcore Profiling） |
+| `model.py` | Step 1 | `BaselineMLP`：3 层 MLP（784 → 256 → 10），模块级自检 |
+| `data_loader.py` | Step 1 | MNIST 数据流水线，像素值域严格保持 [0, 1] |
+| `utils.py` | Step 1 | 随机种子锁定、设备检测、DataLoader worker 种子 |
+| `main_snn.py` | Step 2 | 1.58-bit SNN 训练入口 |
+| `snn_models.py` | Step 2 | `SNN_MLP`：时间循环（T 步）脉冲网络，`IFNode` 平替 `ReLU` |
+| `ternary_ops.py` | Step 2 | `TernaryQuantize`（QAT 核心算子）与 `TernaryLinear` |
+| `check_pth.py` | Step 2 | 校验 `.pth` 权重物理形态（是否已坍缩为三值） |
+| `verify_true_accuracy.py` | Step 2 | 用纯物理权重重跑测试集，验证真实准确率 |
+| `compiler_tvm_nir.py` | Step 3 | 权重坍缩 + 构建 NIR 图，产出 `.nir` 图纸 |
+| `inspect_and_convert_nir.py` | Step 3 | 读取 `.nir`，演示 {-1,0,1} → 兴奋/抑制双阵列拆分 |
+| `generate_spikes.py` | Step 4 | 泊松编码，生成硬件输入激励（golden vectors） |
+| `install_deps.py` | 工具 | 按本机是否有 NVIDIA GPU 自动安装 torch（CUDA/CPU 分支） |
+| `requirements.txt` | 工具 | 依赖清单（静态，按平台分支） |
 
-```python
-# 启动训练的绝对标准姿势
-PYTHONHASHSEED=42 python main.py
+## 快速开始
 
-# 或者直接在当前终端生命周期内写死（推荐）
+### 环境与依赖
+
+```bash
+# 方式一：自动检测 GPU，按需安装（推荐）
+conda create -n snn_baseline python=3.10 -y
+conda activate snn_baseline
+python install_deps.py          # 检测到 NVIDIA GPU → CUDA 版 torch；否则 CPU 版
+
+# 方式二：静态清单安装
+pip install -r requirements.txt
+```
+
+Step 2 / Step 3 的额外依赖（不在此清单内，按需安装）：
+
+```bash
+# Step 2：脉冲生态库（建议从基线环境克隆出专属环境）
+conda create --name snn_step2_spiking --clone snn_baseline
+conda activate snn_step2_spiking
+pip install spikingjelly
+
+# Step 3：NIR 标准格式库
+pip install nir
+```
+
+### 可复现性约定
+
+复现是评估 SNN 精度损失的前提，必须满足：
+
+- 代码入口调用 `set_deterministic_environment(seed=42)`，锁死 Python / NumPy / PyTorch 随机种子及 cudnn 确定性算法。
+- `PYTHONHASHSEED` 无法在代码内设置，需由启动命令注入：
+
+```bash
 export PYTHONHASHSEED=42
 python main.py
-
-TMPDIR=/tmp python main.py 
-
-
 ```
 
-为了锁死多进程（num_workers=2）下的 DataLoader，我们需要在代码层面做两点修改。
+- 训练入口要求连续运行两次，各 Epoch 指标必须逐位一致（见 Step 1 验收）。
 
-第一步：在 utils.py 中新增一个 worker_init_fn 函数。
-这个函数会在每个 worker 启动时被调用，确保为每个 worker 分配一个独立的、基于主进程种子的确定性种子。
+## Step 1 · FP32 基线（PyTorch）
 
-## 1.2 数据摄入流水线
+**目标**：训练至收敛，保存基线权重，证明业务逻辑与数据流水线畅通，并采集传统架构的能耗/显存数据作为后续对比基准。
 
-在这个阶段，我们的数据摄入流水线（Data Ingestion Pipeline）看似普通，但实际上必须为降维车间（Step 2）的脉冲化（Spiking）提前做好关键的铺垫。
+### 设计要点
 
-作为顾问，我必须提醒工程师一个极其容易踩坑的细节：在传统的计算机视觉训练中，大家习惯使用 transforms.Normalize(mean, std) 将像素值标准化到包含负数的区间（如 [-1, 1]）。但在我们未来的 SNN 转换中，我们将使用泊松编码器（Poisson Encoder）把像素转化为脉冲频率。泊松编码器通常要求输入值域严格保持在 [0, 1] 之间（代表发放概率）。
+- **数据流水线**（`data_loader.py`）：直接使用 `torchvision.datasets.MNIST`，仅做 `ToTensor()` 缩放。**严禁添加 `Normalize`**：泊松编码要求输入值域严格落在 [0, 1]（代表发放概率），基线阶段就必须为 Step 4 铺路。
+- **网络纪律**（`model.py`）：极简 3 层 MLP（784 → 256 → 10），仅使用 `nn.Linear` + `nn.ReLU`，**严禁引入 BatchNorm / Dropout / 复杂激活**，为 Step 2 的 `ReLU → IFNode` 平替保留纯净计算图。
+- **训练配置**：`nn.CrossEntropyLoss` + `Adam(lr=1e-3)`，10 个 Epoch，Batch Size 128。期望测试集准确率达 **97% ~ 98%**。
 
-因此，在这个 FP32 的基线阶段，我们就有意不使用 Normalize 减去均值，而是仅仅使用 ToTensor() 完成基础的缩放。这也是“全盘统筹”战略的一部分。
+### 运行与产出
 
-## 1.3 FP32 原生拓扑结构定义
-
-在这份完整版中，我加入了前向传播的张量维度注释以及自检测试代码。作为顾问，我强烈建议工程师团队保留这种“模块级自测”的习惯。因为在降维车间（Step 2）中替换为 SpikingJelly 的神经元节点后，数据会增加一个时间维度（Time-step），提前把现在的静态维度（Batch-size, Features）标清楚，能极大降低后续的时空维度混乱。
-
-**不要为了提高那零点几的准确率去修改网络结构（比如加 Dropout 或改变隐藏层大小），现在的首要任务是确立基线和打通流水线。**
-
-## 1.4 && 1.5
-
-现在我们将把前面所有的模块（环境锁定、数据摄入、网络定义）和最后的“资源剖析导出（Phase 1.5）”缝合在一起。
-
-这正是我们要交给工程师团队执行的 main.py 核心入口。请叮嘱他们：在执行这段代码时，密切关注测试集准确率的收敛情况。对于 MNIST 数据集下的 3 层全连接网络，我们期望在 5-10 个 Epoch 内达到 97% 以上 的准确率。这个数字，就是我们未来评估 SNN 转换精度损失的“黄金天花板”。
-
-确保前置的 set_deterministic_environment、build_data_pipeline 和 BaselineMLP 在同一工程目录下即可直接运行。
-
-运行完这段脚本，我们第一阶段“跑通基线，建立评估参考系”的战略任务就圆满收官了。团队手里将握着一份极其干净的 baseline_fp32_best.pth
-
-## 验收
-
-必须对 Step 1 进行严格的**验收（Acceptance Check）**。如果在不稳固的基线上做量化和脉冲化，后续的 Debug 将是一场灾难。
-
-复查中发现并需告知你的一个环境坑 ⚠️
-
-  验证 num_workers=2 时暴露了一个问题：reasonix 沙箱默认 TMPDIR（/var/folders/.../reasonix-session-tmp-*）会拦截 torch 的共享内存文件创建，导致
-  spawn 多进程 DataLoader 报 RuntimeError: No such file or directory。已通过对照实验确认：
-
-  • TMPDIR=/tmp python main.py 或普通终端下运行 → 完全正常（本次冒烟即在此条件下通过）
-  • macOS 上用 fork 上下文替代也不可行（依旧崩溃，PyTorch 官方不推荐）
-
-  所以：在这台机器上跑训练，请用 TMPDIR=/tmp PYTHONHASHSEED=42 python main.py；在 Linux GPU 服务器上则无此问题，直接按 README
-  姿势运行即可。这是环境限制而非代码缺陷，原代码之前正是被这个 bug "顺带保护"了（CPU 分支回退到
-  num_workers=0），现已在正常环境下真正跑通多进程路径。
-
-要确认 Step 1 是否达到战略目的，请让工程师团队运行，并对着终端的输出日志核对以下“三大黄金验收标准”：
-
-1. 准确率天花板验收（性能指标）
-
-**预期目标**：在 10 个 Epoch 内，测试集准确率必须轻松突破 **97%**（通常在 97.5% - 98% 之间）。
-**诊断预警**：如果准确率一直在 10% 左右（随机瞎猜）徘徊，说明 `data_loader.py` 的数据输入有问题；如果没有达到 97%，说明 `models.py` 的前向传播有 Bug。这个 97% 就是我们未来 SNN 转换的“绝对天花板”，后面的量化只会低于或无限逼近这个值。
-
-1. 绝对决定性验收（复现指标 —— 极其关键）
-
-**预期目标**：让工程师连续运行**两次** `python main.py`。两次输出的每一个 Epoch 的 Train Loss、Test Loss 和准确率（甚至到小数点后四位），**必须百分之百完全一致**。
-**诊断预警**：如果两次运行结果哪怕差了 0.0001，就说明 `utils.py` 的随机种子没有彻底锁死。这在类脑工程中是致命的，因为如果基线飘忽不定，我们就无法证明后续的精度下降是量化造成的，还是系统抖动造成的。
-
-1. “性能原罪”验收（商业指标）
-
-**预期目标**：在脚本运行结束时，终端成功打印出 fvcore 的 Profiling 数据。对于我们 `784 -> 256 -> 10` 的架构，您应该能看到类似如下的确切数字：
-**参数总量**：约 203,530 个
-**单次推理 MACs（乘加次数）**：约 200,000+ 次
-
-**战略意义**：拿到这组确切的数字，我们第一步的商业目的就达到了。后续跑通硬件 Demo 时，您就可以直接把这组数据甩在投资人或客户的桌面上：“看，同样是跑一个小网络，传统架构单次推理需要 20 多万次高功耗的**乘法**，而我们的类脑 MVP 架构实现了纯**加法**计算，且权重零搬运！”
-
-```========== SNN 前置基线工程 (Step 1) 开始 ==========
-
-[Pipeline] Phase 1.1: 环境决定性已强制锁定 (Seed = 42)
-[Pipeline] 当前训练硬件: cpu
-[Pipeline] 正在拉取或验证 MNIST 数据集于目录: ./data ...
-[Pipeline] Phase 1.2 数据流水线构建完毕。
- -> 训练集批次数量: 469 (Batch Size: 128)
- -> 测试集批次数量: 79 (Batch Size: 128)
-
-[Pipeline] 开始训练，目标 Epochs: 10...
-Epoch [1/10] | 耗时: 7.43s | Train Loss: 0.3611 Acc: 90.21% | Test Loss: 0.1914 Acc: 94.46%
-Epoch [2/10] | 耗时: 6.97s | Train Loss: 0.1584 Acc: 95.53% | Test Loss: 0.1276 Acc: 96.17%
-Epoch [3/10] | 耗时: 7.32s | Train Loss: 0.1089 Acc: 96.84% | Test Loss: 0.1008 Acc: 96.98%
-Epoch [4/10] | 耗时: 8.15s | Train Loss: 0.0820 Acc: 97.62% | Test Loss: 0.0892 Acc: 97.20%
-Epoch [5/10] | 耗时: 7.87s | Train Loss: 0.0635 Acc: 98.17% | Test Loss: 0.0874 Acc: 97.14%
-Epoch [6/10] | 耗时: 8.06s | Train Loss: 0.0501 Acc: 98.59% | Test Loss: 0.0740 Acc: 97.68%
-Epoch [7/10] | 耗时: 8.89s | Train Loss: 0.0401 Acc: 98.83% | Test Loss: 0.0733 Acc: 97.69%
-Epoch [8/10] | 耗时: 8.12s | Train Loss: 0.0326 Acc: 99.11% | Test Loss: 0.0662 Acc: 97.94%
-Epoch [9/10] | 耗时: 7.96s | Train Loss: 0.0262 Acc: 99.29% | Test Loss: 0.0692 Acc: 97.76%
-Epoch [10/10] | 耗时: 8.82s | Train Loss: 0.0213 Acc: 99.44% | Test Loss: 0.0618 Acc: 98.03%
-
-[Pipeline] 训练结束！测试集最高准确率: 98.03%
+```bash
+python main.py
 ```
 
-1. 揪出耗电元凶：203,264 次 MACs（乘加运算）
-传统架构的痛点：这 20 多万次操作是浮点数乘法累加（Multiply-Accumulate）。在硅片物理底层，一次 32 位浮点乘法的能耗，大约是一次整数加法的 10 到 30 倍。
+产出 `baseline_fp32_best.pth`（最佳权重）。脚本末尾自动执行 fvcore Profiling，输出架构"性能原罪"数据：约 **203,530 参数**、单次推理约 **203,264 次 MACs**、FP32 权重显存占用约 **2385.12 KB**。这组数字是 Step 4 展示类脑架构优势（纯加法、零搬运）的对比靶子。
 
-我们的改进剧透：在 Step 2 引入 SpikingJelly 后，由于脉冲神经元的输出只有 0 或 1（即发脉冲或不发脉冲），那些复杂的乘法操作将被瞬间抹除。我们的算子将从高能耗的 MAC（乘加） 降维成极低能耗的 AC（纯加法）。这就是为什么我们有底气向客户承诺“微瓦级极低功耗”的物理根据。
+### 验收
 
-1. 瞄准内存墙：2385.12 KB 的显存占用
-传统架构的痛点：对于一个小小的、只认手写数字的网络，居然需要超过 2.3 MB 的连续显存来存放 FP32 权重。在传统冯·诺依曼架构下，计算单元（ALU）为了做这 20 万次计算，必须从 DRAM 里把这 2.3 MB 的数据来回搬运，数据搬运的功耗甚至远超计算本身的功耗。
+1. **准确率天花板**：10 个 Epoch 内测试准确率突破 97%。若停留在 ~10%（瞎猜），检查 `data_loader.py` 输入；若未达 97%，检查 `model.py` 前向传播。
+2. **绝对可复现**：连续运行两次 `python main.py`，每个 Epoch 的 Loss / Acc 必须完全一致。任何微小抖动都说明 `utils.py` 的种子锁定不彻底。
+3. **性能原罪数据**：终端成功打印 fvcore Profiling 数据，MACs 数量级在 20 万左右。
 
-我们的改进剧透：当我们引入 BitNet 1.58-bit 量化理念后，每个原本占用 32 位的权重将被压缩到仅需约 2 个 bit（状态为 -1, 0, 1）。2385 KB 的体积将被直接暴降 16 倍，缩减至约 150 KB 左右！
+## Step 2 · 1.58-bit SNN 量化（SpikingJelly）
 
-核心商业卖点：150 KB 是什么概念？这意味着我们完全不需要外部内存（DRAM），可以直接将权重一次性完整塞进芯片极速的 SRAM 缓存中，永久驻留（Weight Stationary）！数据零搬运，彻底打破内存墙。
+**目标**：将 FP32 模型改造为脉冲网络，并通过量化感知训练（QAT）将权重逼近 {-1, 0, 1} 三值状态，实现"乘法降维为加法"。
 
-(工程注：您看到的参数总量 610590 恰好是实际参数量 203530 的 3 倍，这是因为我们在 fallback 机制中使用了 sum(params.values())，导致 fvcore 字典中的父层级和子层级参数被重复累加了。但这不影响我们评估最核心的 MACs 数量和原始显存占用级别。)
+### 设计要点
 
-# setp 2
+- **算子平替**：`nn.ReLU` → SpikingJelly `IFNode`（积分触发神经元，替代梯度 `surrogate.ATan()`）；`nn.Linear` → `TernaryLinear`。
+- **时间维度（T）**：SNN 通过在 $T$ 个时间步内积分膜电位来发放脉冲。`SNN_MLP` 在 `forward` 内封装时间循环，输出 T 步平均电压，对外接口与 FP32 模型完全一致，可直接复用 Step 1 的训练循环。MVP 取 **T=4**。
+- **工程纪律**：每个 Batch 前向结束后必须调用 `functional.reset_net(self)` 清空膜电位，否则 Batch 间互相污染，模型无法收敛。
+- **QAT 与 STE**（`ternary_ops.py`）：前向将权重截断为 `{-1, 0, 1} × scale`；由于量化与脉冲发放不可导，反向传播使用直通估计器（STE）放行梯度。
+- **训练配置**：沿用 Step 1 的循环与超参，Epochs 放宽至 15。SNN 存在"冷启动/死神经元"现象（首 Epoch 爬升慢于 FP32），属正常表现。
 
-1. ternary_ops.py 在硬件层面，权重将变成纯粹的 {-1, 0, 1}；在训练层面，我们通过自定义 autograd.Function 来实现量化感知训练 (QAT)。
+### 1.58-bit 原理与硬件映射
 
-1. snn_models.py 引入 SpikingJelly 并结合刚才写的 TernaryLinear，对原有的 BaselineMLP 进行脱胎换骨的改造
+**为什么叫 1.58-bit**：BitNet b1.58 将 FP16 权重压缩为三种状态 {-1, 0, 1}，因 $\log_2(3) \approx 1.58$ 而得名。权重仅含 ±1 时，$X \times W$ 退化为加法/减法；权重为 0 则直接断路，跳过计算（激活稀疏性）。
 
-```python
-# 1. 确保当前处于退出状态，或在 base 环境
-conda deactivate
+**硬件无法物理表示 -1，如何落地（双突触阵列）**：单极性器件只能表示 {0, 1}，因此在编译下发阶段把 1 个三值权重矩阵拆为 2 个纯 {0, 1} 阵列：
 
-# 2. 从极其稳定的基线环境“克隆”出一个 Step 2 专属环境
-conda create --name snn_step2_spiking --clone snn_baseline
+| 算法权重 | 兴奋阵列 $W_{pos}$ | 抑制阵列 $W_{neg}$ | 硬件动作 |
+| --- | --- | --- | --- |
+| 1 | 1 | 0 | Bank 0 加法，升高膜电位 |
+| -1 | 0 | 1 | Bank 1 减法，降低膜电位 |
+| 0 | 0 | 0 | 物理断路，零功耗 |
 
-# 3. 激活这个全新的“降维车间”环境
-conda activate snn_step2_spiking
+数学等效式：$W_{ternary} = W_{pos} - W_{neg}$。**训练阶段必须保留 -1**（抑制能力），若强行抹除负权重，网络失去抑制会"癫痫"式放电，精度断崖下跌；拆分动作留给编译后端，软硬解耦。
 
-# 4. 在此安全沙盒内，引入脉冲生态库（此时补装 SpikingJelly）
-pip install spikingjelly
+### 幽灵权重（Ghost Weights）—— 导出前的关键坑
+
+`TernaryQuantize.forward` 中，前向计算确实使用量化权重，但 PyTorch 底层保存并更新的仍是 FP32 连续权重（反向传播梯度极小，若锁死 {-1,0,1} 则梯度加不上、模型无法学习）。因此：
+
+- **`snn_1.58bit_best.pth` 里保存的是"幽灵权重"（FP32 连续值），不是纯三值。**
+- 导出/验证时，必须手动重演坍缩：`scale = w.abs().mean().clamp(min=1e-5)`，`w_q = round(w / scale).clamp(-1, 1) × scale`（见 `compiler_tvm_nir.py` 的 `collapse_to_physical_weight`）。
+- **scale 因子的去向**：硬件只烧录三值整数权重。算法层 $W_q \times scale \times X > V_{threshold}$，编译器将等式两边同除 scale，浮点 scale 被吸收进神经元发射阈值（$\frac{V_{threshold}}{scale}$），硬件内部彻底告别小数。
+
+### 运行与产出
+
+```bash
+python main_snn.py
 ```
 
-在此，我们需要给工程师团队灌输两个极其重要的神经形态工程概念：时间维度 (Time-steps)：传统算子只处理静态的空间特征，而脉冲神经网络（SNN）是有“记忆”的，它通过在 $T$ 个时间步内的不断积分来发放脉冲。直通估计器 (Straight-Through Estimator, STE)：由于脉冲的阶跃发放和 1.58-bit 的量化操作在数学上是不可导的，我们必须用 STE 技术在反向传播时“骗过” PyTorch，让梯度得以流动。为了保持工程模块化，我们将增加一个包含 1.58-bit 逻辑的文件，并重写我们的模型定义。
+产出 `snn_1.58bit_best.pth`。**若误将幽灵权重直接交给硬件，流片阶段必然崩溃**——验收必须严格走以下三维度。
 
+### 验收（三维度立体校验）
 
-## (-1,-,1)的1.58bit
+1. **商业底线（Test 准确率对比）**：Step 2 最终 Epoch 的 Test 准确率对比 Step 1（97.5% ~ 98%）。**只要稳定在 95% ~ 96.5% 即为成功**——以不到 2% 的精度微损，换取功耗与显存数量级的下降。Train 准确率仅作排查 Bug 的辅助指标。
+2. **工程健康度（Train 曲线）**：Train 准确率应呈"初期爬升慢、中后期稳步收敛"。若长期停留在 10%~20% 震荡，说明替代梯度失效或量化 scale 计算有误（死神经元）。
+3. **物理形态（验明正身）**：运行 `python check_pth.py`，对 `.pth` 执行坍缩后打印权重唯一值，应只出现 **3 个值**（如 `-0.12, 0.0, 0.12`）。若出现上千个不同小数，说明量化被旁路，属"假量化"废品。
 
-1. 深度剖析：BitNet b1.58 理念与 `{0, 1}` 硬件的绝妙映射
+**终极兜底**：`python verify_true_accuracy.py` 彻底抛弃量化引擎，用纯物理坍缩权重（{-1,0,1}×scale）塞进标准 `nn.Linear` 重跑测试集——这个数字就是流片后芯片的真实性能。
 
- 什么是 BitNet b1.58 理念？
+## Step 3 · NIR 编译映射
 
-微软提出的 BitNet b1.58 是大模型量化领域的一个里程碑。它将传统的 FP16（16位浮点数）权重，极致压缩到了三种状态：**-1, 0, 1**。因为 $\log_2(3) \approx 1.58$，所以被称为 1.58-bit。
+**目标**：剥离时间外壳，提取纯粹的空间拓扑，翻译为通用的 **NIR（Neuromorphic Intermediate Representation）** 标准图，作为软硬件交接契约。
 
-* **消除乘法**：因为权重只有 -1 和 1，原先的 $X \times W$ 变成了纯粹的加法（$X + X$）或减法（$X - X$）。
-* **激活稀疏性**：其中的 **0** 是神来之笔。它直接屏蔽了这根神经连线，不仅省了空间，连加法计算都直接跳过了，带来了极大的功耗收益。
+### 时间展开天坑
 
- 硬件困境：无法物理表示 `-1` 怎么办？行得通吗？
+Step 2 训练代码中的 `for t in range(self.T)` 循环若直接交给编译器，会被平铺展开成 T 层完全相同的空间网络——**这是绝对错误的**：类脑芯片底层自带时钟 Tick 机制，SRAM 只需存放**单步权重**，时间循环由硬件时钟完成。因此 Step 3 先定义 `SingleStepSNN`（无时间循环、无 reset），仅保留层级连接，再加载量化权重导出。
 
-**绝对行得通，而且这是类脑芯片最经典的玩法！**
+### TVM 的现状（战略性挂起）
 
-您的硬件工程师非常懂行。在真实的物理芯片（如 SRAM 阵列、RRAM 或忆阻器交叉阵列）中，电压或电阻状态通常只有“高/低”或“通/断”，确实只能表示物理上的 `{0, 1}`。单极性器件是无法直接存储负数 `-1` 的。
+FCN 结构只有 `Linear` 与脉冲激活，无可融合算子，引入 TVM 收益为零（"高射炮打蚊子"）。且 Windows 官方 wheel（0.25/0.26）不含 relay 前端。因此当前 NIR 图纸由**权重坍缩直接构建**，TVM 的 `jit.trace → relay → SimplifyInference/FoldConstant` 路径已在 `compiler_tvm_nir.py` 中以注释保留；后续推进 Transformer / 复杂 CNN 时再激活。
 
-为了完美调和“算法层的 1.58-bit ({-1, 0, 1})”与“物理层的 1-bit ({0, 1})”，我们在架构设计上使用**双突触阵列（Dual-Synapse Array）映射法**。
+### 运行与产出
 
-我们在算法层（PyTorch / Step 2）依然**保持 `{-1, 0, 1}` 的训练**，但在编译下发层（TVM / Step 3 和 4），我们将这一个权重矩阵拆分为两个纯 `{0, 1}` 的矩阵：
-
-1. **兴奋性突触矩阵 (Excitatory, $W_{pos}$)**：只包含 0 和 1。
-2. **抑制性突触矩阵 (Inhibitory, $W_{neg}$)**：只包含 0 和 1。
-
-**映射规则极为简单：**
-
-* 当算法权重为 **`1`** 时：映射到硬件 $\rightarrow$ $W_{pos} = 1$, $W_{neg} = 0$ (增加膜电位)
-* 当算法权重为 **`-1`** 时：映射到硬件 $\rightarrow$ $W_{pos} = 0$, $W_{neg} = 1$ (扣减膜电位)
-* 当算法权重为 **`0`** 时：映射到硬件 $\rightarrow$ $W_{pos} = 0$, $W_{neg} = 0$ (物理断路，零功耗)
-
-数学等效公式为：
-
-
-$$W_{ternary} = W_{pos} - W_{neg}$$
-
- 战略顾问的工程结论：
-
-**不需要在 PyTorch (Step 2) 阶段去强行约束 `{0, 1}`！**
-如果您在训练阶段就强行抹除 `-1`，意味着神经网络失去了“抑制（Inhibition）”能力，这会导致脉冲网络极易“癫痫”（所有神经元疯狂放电），精度会断崖式暴跌。
-
-**正确的战略流水线分工是：**
-
-* **操作台与降维车间 (Step 1 & 2)**：算法工程师安心使用 `{-1, 0, 1}` 进行训练，拿到高精度模型。
-* **物理映射器 (Step 3 & 4)**：编译工程师在将网络结构转为 NIR 并烧录到硬件 SRAM 时，自动执行上述的拆分逻辑，将 1 个逻辑层拆到 2 个 `{0, 1}` 的物理阵列上，然后在累加器端执行相减。
-
-这就是软硬件解耦的魅力。算法享受了 1.58-bit 的高精度与稀疏性，硬件维持了极致简陋的 `{0, 1}` 电路设计。
-
-## 降维车间主脚本 (main_snn.py)
-因为我们在 snn_models.py 中将时间循环 (for t in range(self.T)) 和网络状态重置 (functional.reset_net(self)) 极其优雅地封装在了 forward 函数内部，并对外输出了平均电压 (out_voltage / self.T)，这使得整个 SNN 模型在外部看来，和传统的 FP32 模型没有任何接口上的区别。
-
-Epoch 1 的“呆滞期”：在第一个 Epoch 时，由于所有的权重初始状态和脉冲阈值还没有很好地匹配（神经元集体处于“沉默”状态），准确率可能会比 FP32 爬升得更慢。这叫 “冷启动/死神经元现象”，是 SNN 的正常表现，只要后续 Epoch 开始迅速爬升即为正常。
-
-精度微小回落：我们在 Step 1 中拿到了 97% 以上的 FP32 准确率。在这个车间里，由于我们极其残酷地把精度砍到了仅剩 {-1, 0, 1} 且使用了极短的时间步 (T=4)，最终准确率如果能达到 95% - 96% 左右，这就是一次史诗级的商业胜利（用 1%-2% 的精度微损，换取了功耗和显存几十倍的暴降）。
-
-一旦跑通并拿到 snn_1.58bit_best.pth，我们团队的软件工程师就完成了他们在整个端到端流水线中的全部历史使命。接下来的战场，将交给编译器和底层映射专家。
-
-## 验收
-在模型压缩和量化领域，判断产出物是否“正确”，绝对不能只看单一指标，而是要进行**三维度的立体校验**。
-
-直接回答您的核心疑问：**绝对是对比“Test 准确率（Test Accuracy）”！**
-
-Test 准确率代表了模型的泛化能力，这是我们未来交付给客户时的真实表现。Train 准确率在这里仅仅作为排查 Bug（如梯度是否消失）的辅助指标。
-
-要验收 `snn_1.58bit_best.pth` 是否达到战略预期，请让工程师团队严格执行以下三大维度的对比与查验：
-
-维度一：商业底线查验（Test 准确率对比）
-
-* **对比标尺**：拿 Step 2 最终 Epoch 的 **Test 准确率**，去对比 Step 1 (FP32) 最终 Epoch 的 **Test 准确率**。
-* **验收标准（战略性微损）**：我们在 Step 1 的 FP32 Test 准确率通常在 97.5% - 98% 之间。在 Step 2 中，由于我们将 32 位浮点数残忍地砍到了仅剩 3 个状态 `{-1, 0, 1}`，并且只给了极短的时间步（$T=4$），**只要 Step 2 的 Test 准确率能稳定在 95% - 96.5% 之间，这就是一次极其完美的胜利！**
-* **战略话术**：在跟投资人汇报时，这叫“我们仅牺牲了不到 2% 的准确率，换取了功耗暴降 30 倍、显存暴降 16 倍的物理奇迹”。
-
-维度二：工程健康度查验（Train 曲线对比）
-
-* **排查死神经元**：SNN 训练最怕“全军覆没”（所有神经元都不发脉冲）。如果 Step 2 的 Train 准确率一直停留在 10% 左右（瞎猜）或者在 20% 剧烈震荡无法爬升，说明我们的替代梯度（Surrogate Gradient）设置失效，或者量化的 Scale 因子计算有 Bug。
-* **验收标准**：Step 2 的 Train 准确率曲线应该呈现“初期爬升比 FP32 慢，但中后期稳步收敛”的健康态势。
-
-维度三：物理形态查验（“验明正身”）
-
-即使准确率达标，我们也不能盲目相信。既然叫 `1.58bit`，它的权重在物理层面必须已经坍缩成三种状态，否则我们无法骗过硬件。
-
-请让工程师新建一个极简的 `check_pth.py` 脚本，用这 5 行代码对拿到的 `.pth` 文件进行物理“开箱验货”：
-
-```python
-import torch
-import numpy as np
-
-# 加载量化后的权重
-state_dict = torch.load("snn_1.58bit_best.pth", map_location="cpu")
-weight_tensor = state_dict['fc1.weight']
-
-# 打印权重的唯一值（Unique Values）
-unique_vals = torch.unique(weight_tensor).numpy()
-
-print("--- SNN 1.58-bit 权重物理形态开箱 ---")
-print(f"权重中包含的不同数值个数: {len(unique_vals)}")
-print(f"这些数值分别是: {np.round(unique_vals, decimals=4)}")
-
+```bash
+python compiler_tvm_nir.py
 ```
 
-* **黄金验收标准**：如果代码打印出来，发现数值只有极其少量的几个（通常是类似 `-0.12, 0.0, 0.12`，即 `-1, 0, 1` 乘以了一个缩放因子 scale），这就说明量化引擎完美生效了。如果打印出来密密麻麻上千个不同的小数，说明量化代码被旁路了，这就是一个“假量化”的废品。
+产出 `snn_mvp_model.nir`，其拓扑为 `Input → Affine(784→256) → IF → Affine(256→10) → Output`，权重已是物理坍缩后的纯 {-1, 0, 1}（脚本内打印唯一值自检）。
 
-这三大维度同时绿灯放行，您的 `snn_1.58bit_best.pth` 就是一张价值连城的完美图纸！
+### 硬件交接流程
 
-## 幽灵权重
+硬件工程师拿到 `.nir` 后只需做三件事：
 
-既然我们发现了这个问题，请务必通知负责 Step 3（TVM / NIR 映射）的编译工程师。在他们读取 fc1.weight 写入 NIR 图纸之前，必须在代码里加上上面那两行 scale 和 torch.round 的代码，确保烧进 .nir 文件的是纯粹的三值权重！
-在 snn_models.py 中，我们的前向传播确实对权重做了三值化截断 (quantized_weight = TernaryQuantize.apply(self.weight))，实现了纯正的 1.58-bit 计算。但是，PyTorch 在后台依然保留着高精度的 FP32 原始权重（即幽灵权重）。
+1. **解析拓扑**：`nir.read()` 读出 `nir.Affine`（对应交叉阵列/乘加器）与 `nir.IF`（对应神经元电路）。
+2. **物理映射**：将三值权重烧录进 SRAM 存储体 / 忆阻器交叉阵列，把发射阈值配置到累加器比较逻辑。
+3. **路由连线**：配置片上网络（NoC），保证脉冲按层流动。
 
-为什么要这么做？
-这是因为反向传播传回来的梯度往往极其微小（比如 0.0001）。如果我们在内存里把权重死死锁在 {-1, 0, 1}，那么 0 + 0.0001 还是 0，模型将永远无法更新、无法学习。
-因此，PyTorch 的策略是：计算时用量化权重（骗过计算单元），更新时累加到高精度幽灵权重上，保存模型 state_dict() 时，保存的也是高精度的幽灵权重。
+硬件团队无需理解 PyTorch 反向传播或替代梯度——他们只看到纯粹的加减法逻辑与连线拓扑。`.nir` 即软件与硬件之间唯一的交接契约。
 
-如何修正开箱验货脚本？
-我们需要在导出（或查验）时，手动重演一遍“计算缩放因子并截断”的动作，把幽灵权重物理坍缩为最终下发给硬件的真实权重。
+## Step 4 · 流式验证与硬件探针
 
-很多论文和初创公司就是在这里自欺欺人，拿着含有浮点信息的准确率去融钱，结果到了流片阶段全盘崩溃。
-请回忆一下我们在 Step 2 写的核心算子 TernaryQuantize 的 forward（前向传播）函数：
-```python
+**目标**：在周期精确模拟器中按流式方式完成推理，用数据证明"零显存搬运 + 纯加法计算 + 极低延迟"。
 
+### 动作一：泊松编码（输入脉冲流）
 
-@staticmethod
-    def forward(ctx, weight):
-        scale = weight.abs().mean().clamp(min=1e-5)
-        # 【物理坍缩在这里已经发生！】
-        weight_q = torch.round(weight / scale).clamp(-1, 1)
-        return weight_q * scale
+芯片输入引脚只接受 0/1 电平，不认识浮点像素。`generate_spikes.py` 将像素值视为发放概率做泊松采样：像素值 0.8 在 $T$ 个时钟周期内每个周期以 80% 概率发一个脉冲。一张静态 28×28 图片由此变为 $T$ 步离散脉冲流：
 
-
+```bash
+python generate_spikes.py
 ```
 
+产出 `input_spikes_batch0.npy`（形状 `[T, Batch, 784]`，仅含 0/1）与 `expected_output_labels.npy`（期望标签），随 `.nir` 图纸一并交付硬件团队作为黄金测试向量。
 
-在整个训练和测试过程（包括 test_epoch）中，模型进行正向推理时，永远只执行 forward 函数。这意味着，输入图片（数据流）从来没有真正接触过那些 FP32 的幽灵权重。数据流乘以的，永远是经过 torch.round 强制截断后，非黑即白的 {-1, 0, 1}（乘以 scale 因子）。幽灵权重仅仅是在反向传播（backward）更新梯度时，作为一个“记账本”存在于内存里，绝不参与实际的推理计算。关于 Scale 因子在硬件中的消除：您可能会问，代码里还有个 * scale，这不是浮点数吗？在硬件中，突触权重是严格的 {-1, 0, 1}。算法里的公式是：$(W_q \times scale) \times X > V_{threshold}$等到了芯片底层（或 NIR 图纸中），编译器会将等式两边同除以 scale：$W_q \times X > \frac{V_{threshold}}{scale}$这样，权重就变成了纯粹的三值整数，浮点数的 scale 被永远吸收进了神经元的发射阈值（Threshold）里。这就是硬件工程师的极致浪漫！
+### 动作二：权重驻留（Weight Stationary）
 
+模拟器初始化时把 `.nir` 中的三值权重静态烧录进片上 SRAM，此后按 Tick 逐波下发输入脉冲。**整个推理过程严禁读取任何外部存储（DRAM）权重**——权重驻留在计算单元旁，只有脉冲信号在层级间穿梭。
 
-## 暴力剥离验证脚本 (verify_true_accuracy.py)
-如果您依然觉得 PyTorch 内部的机制让人不放心，作为务实的工程团队，我们坚信“Talk is cheap, show me the code”。
+### 三大商业探针
 
-请让您的工程师运行以下这个“终极暴力验证脚本”。这个脚本彻底抛弃了我们之前写的量化引擎 TernaryLinear，直接使用最死板的 PyTorch 标准线性层，将提取出来的纯粹的 {-1, 0, 1}（通过补丁提取的真实物理权重）直接强行塞进去进行测试。
+1. **DRAM Access Count（外部显存访问次数）**：总线接口埋点。报告须显示 `DRAM Read/Write = 0 Bytes`。一次 DRAM 访问功耗约为 SRAM 的 100~200 倍，零搬运是"微瓦级功耗"承诺的物理依据（对比：传统 GPU 为 20 万次乘法需从 HBM/GDDR 搬运 2.3 MB 权重）。
+2. **SOPs（突触操作计数）**：神经元发脉冲且下游权重非 0 时计数 +1（纯加法/减法，无乘法）。神经元未触发则下游直接跳过（事件驱动稀疏性）。由于 MNIST 黑色背景（像素为 0）与权重稀疏性（大量权重为 0），SOPs 总量将远小于传统架构的 20 万次 MACs——"不发脉冲就不耗电"。
+3. **First-Spike Latency（首事件延迟）**：测第一根输入脉冲到输出层首个分类脉冲的时间差。无需等整个 Batch 收齐，特征足够明显时网络在早期 Tick 即开始发放正确类别脉冲——对 DVS 避障等实时场景是核心卖点。
 
-# step 3
+## 编译后端：从 NIR 到 SRAM 烧录文件
 
-物理映射器核心代码 (compiler_tvm_nir.py)
+算法团队的工作止步于 `.nir`；将三值权重拆分为物理 `{0, 1}` 阵列是编译后端（Compiler/BSP）的职责：
 
-请让团队安装 NIR 库 (pip install nir)，并确保环境中已安装 tvm。由于 TVM 编译较为复杂，这里提供的是一套高度实用且极具演示价值的工程抽象代码
+- 硬件通过**物理 SRAM Bank 地址**区分兴奋/抑制：`SRAM_Bank_0` 数据线接累加器正极（执行加法），`SRAM_Bank_1` 接负极（执行减法）。硬件不感知数据逻辑含义，只遵循"Bank 0 加、Bank 1 减"的物理法则。
+- 终极交付物不是 NumPy 数组，而是带物理地址的**存储器初始化文件**（`.hex` / `.coe` / `.bin`），例如：
+
+```text
+layer1_excitatory_bank0.hex   # w_pos，指示烧录到 Bank 0
+layer1_inhibitory_bank1.hex   # w_neg，指示烧录到 Bank 1
+```
+
+- 生成方式：`inspect_and_convert_nir.py` 演示了拆分逻辑（`w_pos = (w > 0)`、`w_neg = (w < 0)`），按硬件要求的格式遍历写出即可，半天工作量。
+- 需向硬件确认两个参数：**交付文件格式**（.txt / .hex / .coe）与 **SRAM Bank 地址空间起点**。
+
+## 已知问题与注意事项
+
+- **macOS / 沙箱环境 TMPDIR 坑**：`num_workers=2` 的 DataLoader 在部分沙箱环境会因默认 TMPDIR 拦截 torch 共享内存文件创建而报 `RuntimeError: No such file or directory`（实测对照：macOS 上 `fork` 上下文替代亦不可行）。此类机器请用 `TMPDIR=/tmp PYTHONHASHSEED=42 python main.py` 运行；Linux GPU 服务器无此问题，属环境限制而非代码缺陷。
+- **fvcore 参数统计重复累加**：`main.py` 中 `sum(params.values())` 会把父层级与子层级参数重复计入（打印值 610,590 = 实际参数 203,530 × 3），不影响 MACs 与显存占用级别的评估。
+- **TVM 流程挂起**：见 Step 3 说明，当前 FCN 阶段绕过，NIR 由权重坍缩直接构建。
