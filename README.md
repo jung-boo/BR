@@ -46,6 +46,8 @@ PyTorch FP32 基线  →  1.58-bit SNN 量化  →  NIR 标准图  →  硬件/�
 
 ### 环境与依赖
 
+
+
 ```bash
 # 方式一：自动检测 GPU，按需安装（推荐）
 conda create -n snn_baseline python=3.10 -y
@@ -60,8 +62,8 @@ Step 2 / Step 3 的额外依赖（不在此清单内，按需安装）：
 
 ```bash
 # Step 2：脉冲生态库（建议从基线环境克隆出专属环境）
-conda create --name snn_step2_spiking --clone snn_baseline
-conda activate snn_step2_spiking
+conda create --name snn_spiking --clone snn_baseline
+conda activate snn_spiking
 pip install spikingjelly
 
 # Step 3：NIR 标准格式库

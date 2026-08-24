@@ -1,0 +1,21 @@
+{
+    "name": "Neuromorphic-Dev-Env",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    // 核心透传配置：告诉 Docker 使用所有可用的 GPU 资源
+    "runArgs": [
+        "--gpus",
+        "all"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-vscode.cpptools",
+                "twxs.cmake"
+            ]
+        }
+    },
+    "remoteUser": "root"
+}
